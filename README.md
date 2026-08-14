@@ -1,4 +1,8 @@
-# Bop
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=flat-square&logo=windows&logoColor=white)
+![.NET](https://img.shields.io/badge/.NET_8.0-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![Audio Only](https://img.shields.io/badge/YouTube-Audio_Only-FF0000?style=flat-square&logo=youtube&logoColor=white)
+![GitHub Release](https://img.shields.io/github/v/release/caremyro/Bop?style=flat-square&color=218838&logo=github&logoColor=white)
+# <img src="gmalalatete.ico" width="32" height="32" valign="middle"> Bop
 
 **Bop** is a minimal Windows system-tray audio player that plays only the **audio track** of YouTube videos — it never downloads the video stream.
 
