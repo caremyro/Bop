@@ -217,7 +217,7 @@ public class BopApplicationContext : ApplicationContext
 
             if (!IsLikelyValidMediaUrl(clipboardText))
             {
-                MessageBox.Show("Ceci ne ressemble pas à une URL valide.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("This does not look like a valid URL.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -225,7 +225,7 @@ public class BopApplicationContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Error clipboard read: {ex.Message}", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show($"Error clipboard read, please try again.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -378,7 +378,7 @@ public class BopApplicationContext : ApplicationContext
 
             if (!IsLikelyValidMediaUrl(url))
             {
-                MessageBox.Show("Ceci ne ressemble pas à une URL valide.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("This does not look like a valid URL.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -398,7 +398,7 @@ public class BopApplicationContext : ApplicationContext
                 var info = await _ytDl.RunVideoDataFetch(url, fetchTimeout.Token);
                 if (info?.Data != null)
                 {
-                    newItem.Title = info.Data.Title ?? "Titre inconnu";
+                    newItem.Title = info.Data.Title ?? "Unknown Title";
                     newItem.Channel = info.Data.Uploader ?? info.Data.Channel ?? "";
                     newItem.Duration = TimeSpan.FromSeconds(info.Data.Duration ?? 0);
                     _playerForm?.UpdateQueue(_playlistQueue);
