@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -10,7 +13,6 @@ using NHotkey;
 using NHotkey.WindowsForms;
 using YoutubeDLSharp;
 using Bop.Services;
-using System.Reflection;
 
 namespace Bop;
 
@@ -31,6 +33,20 @@ public class BopApplicationContext : ApplicationContext
     private const string RunRegistryKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     private float _currentVolume = 0.5f;
 
+    private readonly List<QueueItem> _playlistQueue = new();
+    private const int MaxQueueSize = 6;
+
+    // Sérialise tous les appels à PlayUrlAsync : évite que deux lectures démarrées
+    // en parallèle (double-clic, skip manuel + fin de piste simultanés, etc.)
+    // ne se chevauchent en audio.
+    private readonly SemaphoreSlim _playbackLock = new(1, 1);
+
+    // Anti-rebond pour le toggle play/pause : évite un double-déclenchement
+    // (hotkey global + WM_APPCOMMAND) qui annulerait visuellement l'action.
+    private DateTime _lastToggleTime = DateTime.MinValue;
+
+    private bool _isAddingToQueue = false;
+
     public static Icon? GetEmbeddedIcon(string resourceName)
     {
         var assembly = Assembly.GetExecutingAssembly();
@@ -40,10 +56,14 @@ public class BopApplicationContext : ApplicationContext
 
     public BopApplicationContext()
     {
+        string baseDir = AppContext.BaseDirectory;
         _ytDl = new YoutubeDL
         {
-            YoutubeDLPath = "yt-dlp.exe",
-            FFmpegPath = "ffmpeg.exe"
+            // Chemins absolus : un exécutable "yt-dlp.exe" relatif pourrait être
+            // substitué par un binaire malveillant place plus tôt dans la résolution
+            // de chemin (binary planting / search-order hijacking).
+            YoutubeDLPath = Path.Combine(baseDir, "yt-dlp.exe"),
+            FFmpegPath = Path.Combine(baseDir, "ffmpeg.exe")
         };
 
         _contextMenu = new ContextMenuStrip();
@@ -59,7 +79,6 @@ public class BopApplicationContext : ApplicationContext
 
         var exitMenuItem = new ToolStripMenuItem("Exit", null, OnExitClicked);
 
-        // Thème sombre / clair
         ApplyContextMenuTheme();
         SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
 
@@ -89,7 +108,6 @@ public class BopApplicationContext : ApplicationContext
             }
         };
 
-        // Construction du menu
         _contextMenu.Items.Add(_titleMenuItem);
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(pastePlayMenuItem);
@@ -99,15 +117,49 @@ public class BopApplicationContext : ApplicationContext
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(exitMenuItem);
 
-        _playerForm = new PlayerForm(
+        _playerForm = CreatePlayerForm();
+    }
+
+    private PlayerForm CreatePlayerForm()
+    {
+        return new PlayerForm(
             onVolumeChanged: vol => SetVolume(vol),
             onSeekRequested: targetPercent => SeekToPercent(targetPercent),
             onPlayPauseToggled: () => TogglePlayPause(),
-            onStopRequested: () => StopAudio()
+            onStopRequested: () => StopAudio(),
+            onAddRequested: async () => await AddClipboardToQueueAsync(),
+            onSkipRequested: async () => await SkipNextAsync(),
+            onRemoveRequested: id => RemoveFromQueue(id)
         );
     }
 
-    // --- GESTION DES ÉVÉNEMENTS DU MENU CONTEXTUEL ---
+    private void RemoveFromQueue(Guid id)
+    {
+        // Recherche par identifiant stable plutôt que par index : robuste même si
+        // la liste a changé entre le moment où l'utilisateur a survolé l'élément
+        // et celui où il a cliqué (ex. auto-skip entre-temps).
+        int removed = _playlistQueue.RemoveAll(q => q.Id == id);
+        if (removed > 0)
+        {
+            _playerForm?.UpdateQueue(_playlistQueue);
+        }
+    }
+
+    private async Task SkipNextAsync()
+    {
+        if (_playlistQueue.Count > 0)
+        {
+            var nextItem = _playlistQueue[0];
+            _playlistQueue.RemoveAt(0);
+            _playerForm?.UpdateQueue(_playlistQueue);
+            await PlayUrlAsync(nextItem.Url);
+        }
+        else
+        {
+            StopAudio();
+        }
+    }
+
     private void OnTogglePlayerClicked(object? sender, EventArgs e)
     {
         if (_playerForm == null) return;
@@ -122,7 +174,6 @@ public class BopApplicationContext : ApplicationContext
             _playerForm.BringToFront();
         }
     }
-
 
     private void SetVolume(float volume)
     {
@@ -142,6 +193,17 @@ public class BopApplicationContext : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// Vérifie que la chaîne est une URL http(s) absolue valide avant de la transmettre
+    /// à yt-dlp. Bloque au passage toute tentative d'injection d'arguments (une chaîne
+    /// commençant par "-" ne peut pas être une URI absolue valide).
+    /// </summary>
+    private static bool IsLikelyValidMediaUrl(string input)
+    {
+        if (!Uri.TryCreate(input, UriKind.Absolute, out var uri)) return false;
+        return uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps;
+    }
+
     private async void OnPasteAndPlayClicked(object? sender, EventArgs e)
     {
         try
@@ -150,6 +212,12 @@ public class BopApplicationContext : ApplicationContext
             if (string.IsNullOrWhiteSpace(clipboardText))
             {
                 MessageBox.Show("Clipboard is empty or contains no text.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!IsLikelyValidMediaUrl(clipboardText))
+            {
+                MessageBox.Show("Ceci ne ressemble pas à une URL valide.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
@@ -163,90 +231,195 @@ public class BopApplicationContext : ApplicationContext
 
     private async Task PlayUrlAsync(string url)
     {
-        StopAudio();
-
-        if (_playerForm == null || _playerForm.IsDisposed)
+        // Sérialise les appels concurrents (double-clic sur "+", skip manuel pile au
+        // moment où la piste se termine naturellement, etc.) : sans ce verrou, deux
+        // appels en vol peuvent chacun créer leur propre WaveOutEvent et jouer en
+        // même temps (chevauchement audio) en plus de fuir l'ancien flux.
+        await _playbackLock.WaitAsync();
+        try
         {
-            _playerForm = new PlayerForm(
-                onVolumeChanged: vol => SetVolume(vol),
-                onSeekRequested: targetPercent => SeekToPercent(targetPercent),
-                onPlayPauseToggled: () => TogglePlayPause(),
-                onStopRequested: () => StopAudio()
-            );
+            StopAudio();
+
+            if (_playerForm == null || _playerForm.IsDisposed)
+            {
+                _playerForm = CreatePlayerForm();
+            }
+
+            _playerForm.Show();
+            _playerForm.BringToFront();
+            _playerForm.SetLoadingState("Fetching media info...");
+
+            using var fetchTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+            try
+            {
+                var mediaInfo = await _ytDl.RunVideoDataFetch(url, fetchTimeout.Token);
+
+                if (mediaInfo != null && mediaInfo.Success && mediaInfo.Data != null && mediaInfo.Data.Formats != null)
+                {
+                    _urlResolver = new YoutubeUrlResolver();
+                    string? bestAudioUrl = _urlResolver.GetBestAudioUrl(mediaInfo.Data.Formats);
+
+                    if (string.IsNullOrEmpty(bestAudioUrl))
+                    {
+                        _playerForm.SetLoadingState("No audio stream found.");
+                        return;
+                    }
+
+                    string decodedUrl = System.Net.WebUtility.UrlDecode(bestAudioUrl);
+
+                    MediaFoundationReader? newAudioFile = null;
+                    WaveOutEvent? newOutputDevice = null;
+                    try
+                    {
+                        newAudioFile = new MediaFoundationReader(decodedUrl);
+                        newOutputDevice = new WaveOutEvent();
+                        newOutputDevice.Init(newAudioFile);
+                        newOutputDevice.Volume = _currentVolume;
+                        newOutputDevice.PlaybackStopped += OnPlaybackStopped;
+                        newOutputDevice.Play();
+                    }
+                    catch
+                    {
+                        // Nettoyage si l'initialisation échoue à mi-chemin (ex. flux
+                        // audio invalide) : évite de fuir un MediaFoundationReader ou
+                        // un WaveOutEvent à moitié construit.
+                        newOutputDevice?.Dispose();
+                        newAudioFile?.Dispose();
+                        throw;
+                    }
+
+                    _audioFile = newAudioFile;
+                    _outputDevice = newOutputDevice;
+
+                    _playerForm.UpdateQueue(_playlistQueue);
+
+                    string channelName = mediaInfo.Data.Uploader ?? mediaInfo.Data.Channel ?? "YouTube";
+                    _titleMenuItem.Text = $"BOP - [{channelName}]";
+
+                    string? thumbnailUrl = mediaInfo.Data.Thumbnail;
+
+                    if (string.IsNullOrEmpty(thumbnailUrl) && !string.IsNullOrEmpty(mediaInfo.Data.ID))
+                    {
+                        thumbnailUrl = $"https://img.youtube.com/vi/{mediaInfo.Data.ID}/hqdefault.jpg";
+                    }
+
+                    _playerForm.BindMedia(
+                        mediaInfo.Data.Title ?? "Unknown Title",
+                        channelName,
+                        _outputDevice,
+                        _audioFile,
+                        _currentVolume,
+                        thumbnailUrl
+                    );
+                }
+                else
+                {
+                    _playerForm.SetLoadingState("Invalid URL or video unavailable.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _playerForm.SetLoadingState("Timed out fetching media info.");
+            }
+            catch (Exception ex)
+            {
+                _playerForm.SetLoadingState($"Error: {ex.Message}");
+            }
+        }
+        finally
+        {
+            _playbackLock.Release();
+        }
+    }
+
+    private async void OnPlaybackStopped(object? sender, StoppedEventArgs e)
+    {
+        if (e.Exception != null)
+        {
+            // Le flux s'est arrêté à cause d'une erreur (ex. coupure réseau) et non
+            // parce que la piste est terminée : ne pas enchaîner sur la suivante
+            // silencieusement, informer l'utilisateur à la place.
+            _playerForm?.SetLoadingState($"Playback error: {e.Exception.Message}");
+            return;
         }
 
-        _playerForm.Show();
-        _playerForm.BringToFront();
-        _playerForm.SetLoadingState("Fetching media info...");
+        await SkipNextAsync();
+    }
+
+    public async Task AddClipboardToQueueAsync()
+    {
+        // Empêche un double-clic rapide sur "+" de contourner la limite MaxQueueSize
+        // ou de déclencher deux PlayUrlAsync concurrents via la branche "rien ne joue".
+        if (_isAddingToQueue) return;
+        _isAddingToQueue = true;
 
         try
         {
-            var mediaInfo = await _ytDl.RunVideoDataFetch(url);
-
-            if (mediaInfo != null && mediaInfo.Success && mediaInfo.Data != null && mediaInfo.Data.Formats != null)
+            if (_playlistQueue.Count >= MaxQueueSize)
             {
-                // Cherche le meilleur flux audio disponible
-                _urlResolver = new YoutubeUrlResolver();
-                string? bestAudioUrl = _urlResolver.GetBestAudioUrl(mediaInfo.Data.Formats);
-
-                if (string.IsNullOrEmpty(bestAudioUrl))
-                {
-                    _playerForm.SetLoadingState("No audio stream found.");
-                    return;
-                }
-
-                // Décode l'URL pour éviter les problèmes d'encodage
-                string decodedUrl = System.Net.WebUtility.UrlDecode(bestAudioUrl);
-
-                // Lit l'audio à partir de l'URL décodée
-                _audioFile = new MediaFoundationReader(decodedUrl);
-                _outputDevice = new WaveOutEvent();
-                _outputDevice.Init(_audioFile);
-                _outputDevice.Volume = _currentVolume;
-                _outputDevice.Play();
-
-                string channelName = mediaInfo.Data.Uploader ?? mediaInfo.Data.Channel ?? "YouTube";
-                _titleMenuItem.Text = $"BOP - [{channelName}]";
-
-                string? thumbnailUrl = mediaInfo.Data.Thumbnail;
-
-                if (string.IsNullOrEmpty(thumbnailUrl) && !string.IsNullOrEmpty(mediaInfo.Data.ID))
-                {
-                    thumbnailUrl = $"https://img.youtube.com/vi/{mediaInfo.Data.ID}/hqdefault.jpg";
-                }
-
-                // Met à jour l'interface du lecteur avec les informations récupérées
-                _playerForm.BindMedia(
-                    mediaInfo.Data.Title ?? "Unknown Title",
-                    channelName,
-                    _outputDevice,
-                    _audioFile,
-                    _currentVolume,
-                    thumbnailUrl
-                );
+                MessageBox.Show($"No more lil bro ! (Max {MaxQueueSize} videos)", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
-            else
+
+            string url;
+            try
             {
-                _playerForm.SetLoadingState("Invalid URL or video unavailable.");
+                url = Clipboard.GetText().Trim();
             }
+            catch
+            {
+                // Le presse-papier peut être verrouillé par un autre process (ExternalException) :
+                // on abandonne silencieusement plutôt que de laisser planter la tâche async.
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            if (!IsLikelyValidMediaUrl(url))
+            {
+                MessageBox.Show("Ceci ne ressemble pas à une URL valide.", "BOP", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_outputDevice == null || _outputDevice.PlaybackState == PlaybackState.Stopped)
+            {
+                await PlayUrlAsync(url);
+                return;
+            }
+
+            var newItem = new QueueItem { Url = url };
+            _playlistQueue.Add(newItem);
+            _playerForm?.UpdateQueue(_playlistQueue);
+
+            try
+            {
+                using var fetchTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var info = await _ytDl.RunVideoDataFetch(url, fetchTimeout.Token);
+                if (info?.Data != null)
+                {
+                    newItem.Title = info.Data.Title ?? "Titre inconnu";
+                    newItem.Channel = info.Data.Uploader ?? info.Data.Channel ?? "";
+                    newItem.Duration = TimeSpan.FromSeconds(info.Data.Duration ?? 0);
+                    _playerForm?.UpdateQueue(_playlistQueue);
+                }
+            }
+            catch { }
         }
-        catch (Exception ex)
+        finally
         {
-            _playerForm.SetLoadingState($"Error: {ex.Message}");
+            _isAddingToQueue = false;
         }
     }
 
-    // --- GESTION DES RACCOURCIS CLAVIER ---
-    private void OnGlobalHotkey(object? sender, HotkeyEventArgs e)
-    {
-        TogglePlayPause();
-        e.Handled = true;
-    }
-
-    
-    // --- MÉTHODES DE CONTRÔLE DE LA LECTURE AUDIO ---
     private void TogglePlayPause()
     {
+        // PlayerForm peut invoquer ce toggle depuis deux sources pour la même pression
+        // physique de touche (hotkey global RegisterHotKey + message WM_APPCOMMAND) :
+        // un court anti-rebond évite un double-toggle qui annulerait l'action.
+        if ((DateTime.UtcNow - _lastToggleTime).TotalMilliseconds < 200) return;
+        _lastToggleTime = DateTime.UtcNow;
+
         if (_outputDevice == null) return;
 
         if (_outputDevice.PlaybackState == PlaybackState.Playing)
@@ -263,6 +436,7 @@ public class BopApplicationContext : ApplicationContext
     {
         if (_outputDevice != null)
         {
+            _outputDevice.PlaybackStopped -= OnPlaybackStopped;
             _outputDevice.Stop();
             _outputDevice.Dispose();
             _outputDevice = null;
@@ -298,7 +472,10 @@ public class BopApplicationContext : ApplicationContext
 
         if (enable)
         {
-            key.SetValue(AppName, Application.ExecutablePath);
+            // Chemin entre guillemets : un chemin contenant un espace et non quoté
+            // peut être mal interprété par Windows au démarrage (ex. "C:\Program.exe"
+            // exécuté à la place de "C:\Program Files\Bop\Bop.exe").
+            key.SetValue(AppName, $"\"{Application.ExecutablePath}\"");
         }
         else
         {
@@ -313,7 +490,6 @@ public class BopApplicationContext : ApplicationContext
         Application.Exit();
     }
 
-    // --- GESTION DU THÈME SOMBRE / CLAIR ---
     private bool IsWindowsInDarkMode()
     {
         try
