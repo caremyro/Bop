@@ -8,17 +8,32 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 using NAudio.Wave;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace Bop;
 
 public class PlayerForm : Form
 {
+    [DllImport("user32.dll")]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    private static extern bool ChangeWindowMessageFilter(uint msg, uint flags);
+
+    private const int HOTKEY_ID = 9000;
+    private const int WM_HOTKEY = 0x0312;
+    private const uint VK_MEDIA_PLAY_PAUSE = 0xCD;
+    private const uint VK_F8 = 0x77;
     public static Icon? GetEmbeddedIcon(string resourceName)
     {
         var assembly = Assembly.GetExecutingAssembly();
         using var stream = assembly.GetManifestResourceStream($"Bop.{resourceName}");
         return stream != null ? new Icon(stream) : null;
     }
+
     private readonly Action<float> _onVolumeChanged;
     private readonly Action<double> _onSeekRequested;
     private readonly Action _onPlayPauseToggled;
@@ -32,20 +47,38 @@ public class PlayerForm : Form
     private double _currentProgress = 0.0;
     private float _currentVolume = 0.5f;
     private Image? _coverImage = null;
+    private Bitmap? _blurredBanner = null;
+    private Bitmap? _sharpBanner = null;
     private static readonly HttpClient _httpClient = new();
     private bool _isDarkMode = false;
+    private bool _isHoveringBanner = false; // Suivi du survol de la miniature
+
+    // --- Palette ---
     private Color _bgColor;
     private Color _primaryTextColor;
     private Color _secondaryTextColor;
-    private Color _iconColor;
     private Color _trackBgColor;
     private Color _coverBgColor;
+    private Color _coverBgColor2;
+    private readonly Color _accentColor = Color.FromArgb(151, 125, 255);
+
+    private const int WM_APPCOMMAND = 0x0319;
+    private const int APPCOMMAND_MEDIA_PLAY_PAUSE = 14;
+
+    // --- Zones cliquables ---
+    private const int BannerHeight = 190;
+    private Rectangle _bannerRect;
     private Rectangle _playBtnBounds;
     private Rectangle _prevBtnBounds;
     private Rectangle _nextBtnBounds;
     private Rectangle _closeBtnBounds;
     private Rectangle _seekBarBounds;
     private Rectangle _volumeBarBounds;
+
+    // --- Survol (hover) ---
+    private enum HoverTarget { None, Play, Prev, Next, Close }
+    private HoverTarget _hoveredButton = HoverTarget.None;
+
     private readonly System.Windows.Forms.Timer _updateTimer;
 
     public PlayerForm(
@@ -61,21 +94,22 @@ public class PlayerForm : Form
 
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
-        Size = new Size(340, 420);
+        Size = new Size(340, 350);
         TopMost = true;
         DoubleBuffered = true;
 
         var primaryScreen = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 800, 600);
         Location = new Point(primaryScreen.Right - Width - 30, primaryScreen.Bottom - Height - 30);
 
-        _closeBtnBounds = new Rectangle(Width - 25, 10, 12, 12);
-        _seekBarBounds = new Rectangle(25, 250, 290, 10);
+        _bannerRect = new Rectangle(0, 0, Width, BannerHeight);
+        _closeBtnBounds = new Rectangle(Width - 40, 14, 26, 26);
 
-        _prevBtnBounds = new Rectangle(65, 295, 36, 36);
-        _playBtnBounds = new Rectangle(145, 288, 50, 50);
-        _nextBtnBounds = new Rectangle(239, 295, 36, 36);
+        _playBtnBounds = new Rectangle((Width - 56) / 2, 118, 56, 56);
+        _prevBtnBounds = new Rectangle(_playBtnBounds.X - 40 - 14, 126, 40, 40);
+        _nextBtnBounds = new Rectangle(_playBtnBounds.Right + 14, 126, 40, 40);
 
-        _volumeBarBounds = new Rectangle(65, 370, 210, 10);
+        _seekBarBounds = new Rectangle(25, 200, Width - 50, 14);
+        _volumeBarBounds = new Rectangle(65, 300, Width - 130, 14);
 
         ApplyRoundedRegion(24);
         UpdateThemeColors();
@@ -87,16 +121,59 @@ public class PlayerForm : Form
         MouseDown += PlayerForm_MouseDown;
         MouseUp += PlayerForm_MouseUp;
         MouseMove += PlayerForm_MouseMove;
+        MouseLeave += PlayerForm_MouseLeave;
 
         var icon = GetEmbeddedIcon("gmalalatete.ico");
-        if (icon != null)
+        this.Icon = icon ?? SystemIcons.Application;
+        //RegisterHotKey(this.Handle, HOTKEY_ID, 0x0000, VK_MEDIA_PLAY_PAUSE);
+        //ChangeWindowMessageFilter(0x0312 /* WM_HOTKEY */, 1 /* MSGFLT_ADD */);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+
+        // Autorise le message Hotkey même si l'application tourne avec des privilèges différents
+        ChangeWindowMessageFilter(WM_HOTKEY, 1 /* MSGFLT_ADD */);
+
+        // Essaie d'enregistrer la touche média (Fn+F8 sur la plupart des PC portable)
+        bool registered = RegisterHotKey(this.Handle, HOTKEY_ID, 0x0000, VK_MEDIA_PLAY_PAUSE);
+
+        // Si la touche Média native est déjà bloquée par Spotify/Chrome, on écoute Ctrl + F8 en secours
+        if (!registered)
         {
-            this.Icon = icon;
+            const uint MOD_CONTROL = 0x0002;
+            RegisterHotKey(this.Handle, HOTKEY_ID, MOD_CONTROL, VK_F8);
         }
-        else
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
         {
-            this.Icon = SystemIcons.Application; // Icône de secours si problème
+            _onPlayPauseToggled();
+            Invalidate();
+            return;
         }
+        
+        if (m.Msg == WM_APPCOMMAND)
+        {
+            int cmd = (int)((m.LParam.ToInt64() >> 16) & 0xFFFF);
+            if (cmd == APPCOMMAND_MEDIA_PLAY_PAUSE)
+            {
+                _onPlayPauseToggled();
+                Invalidate();
+                return;
+            }
+        }
+
+        base.WndProc(ref m);
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        UnregisterHotKey(this.Handle, HOTKEY_ID);
+        base.OnHandleDestroyed(e);
     }
 
     private bool IsWindowsInDarkMode()
@@ -114,27 +191,53 @@ public class PlayerForm : Form
         return false;
     }
 
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Nettoyage du raccourci global
+        UnregisterHotKey(this.Handle, HOTKEY_ID);
+
+        // Nettoyage des événements système
+        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+
+        // Libération de la mémoire des images
+        _coverImage?.Dispose();
+        _coverImage = null;
+        _blurredBanner?.Dispose();
+        _blurredBanner = null;
+        _sharpBanner?.Dispose();
+        _sharpBanner = null;
+
+        // Si l'utilisateur clique sur la croix, masque la fenêtre au lieu de la fermer
+        if (e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+        }
+
+        base.OnFormClosing(e);
+    }
+
     private void UpdateThemeColors()
     {
         _isDarkMode = IsWindowsInDarkMode();
 
         if (_isDarkMode)
         {
-            _bgColor = Color.FromArgb(30, 30, 35);
-            _primaryTextColor = Color.FromArgb(245, 245, 250);
-            _secondaryTextColor = Color.FromArgb(160, 160, 175);
-            _iconColor = Color.FromArgb(240, 240, 245);
-            _trackBgColor = Color.FromArgb(60, 60, 70);
-            _coverBgColor = Color.FromArgb(100, 85, 165);
+            _bgColor = Color.FromArgb(24, 24, 28);
+            _primaryTextColor = Color.FromArgb(248, 248, 252);
+            _secondaryTextColor = Color.FromArgb(165, 165, 178);
+            _trackBgColor = Color.FromArgb(58, 58, 68);
+            _coverBgColor = Color.FromArgb(94, 74, 165);
+            _coverBgColor2 = Color.FromArgb(58, 44, 110);
         }
         else
         {
-            _bgColor = Color.White;
-            _primaryTextColor = Color.FromArgb(40, 40, 50);
-            _secondaryTextColor = Color.FromArgb(120, 120, 130);
-            _iconColor = Color.FromArgb(50, 52, 56);
-            _trackBgColor = Color.FromArgb(200, 202, 206);
-            _coverBgColor = Color.FromArgb(200, 182, 255);
+            _bgColor = Color.FromArgb(250, 250, 252);
+            _primaryTextColor = Color.FromArgb(30, 30, 38);
+            _secondaryTextColor = Color.FromArgb(115, 115, 128);
+            _trackBgColor = Color.FromArgb(222, 222, 228);
+            _coverBgColor = Color.FromArgb(196, 178, 255);
+            _coverBgColor2 = Color.FromArgb(150, 130, 235);
         }
 
         BackColor = _bgColor;
@@ -156,10 +259,10 @@ public class PlayerForm : Form
     }
 
     public void BindMedia(
-        string title, 
-        string channelName = "YouTube Channel", 
-        WaveOutEvent? outputDevice = null, 
-        MediaFoundationReader? audioFile = null, 
+        string title,
+        string channelName = "YouTube Channel",
+        WaveOutEvent? outputDevice = null,
+        MediaFoundationReader? audioFile = null,
         float currentVolume = 0.5f,
         string? thumbnailUrl = null)
     {
@@ -169,9 +272,12 @@ public class PlayerForm : Form
         _audioFile = audioFile;
         _currentVolume = currentVolume;
 
-        // Nettoyer l'ancienne image
         _coverImage?.Dispose();
         _coverImage = null;
+        _blurredBanner?.Dispose();
+        _blurredBanner = null;
+        _sharpBanner?.Dispose();
+        _sharpBanner = null;
 
         if (!string.IsNullOrEmpty(thumbnailUrl))
         {
@@ -191,9 +297,13 @@ public class PlayerForm : Form
             byte[] bytes = await _httpClient.GetByteArrayAsync(url);
             using MemoryStream ms = new MemoryStream(bytes);
             Image downloadedImg = Image.FromStream(ms);
-            
+
             _coverImage = (Image)downloadedImg.Clone();
-            
+            _blurredBanner?.Dispose();
+            _blurredBanner = CreateBlurredBanner(_coverImage, _bannerRect.Width, _bannerRect.Height);
+            _sharpBanner?.Dispose();
+            _sharpBanner = CreateSharpBanner(_coverImage, _bannerRect.Width, _bannerRect.Height);
+
             if (!IsDisposed && IsHandleCreated)
             {
                 BeginInvoke(new Action(Invalidate));
@@ -202,7 +312,75 @@ public class PlayerForm : Form
         catch
         {
             _coverImage = null;
+            _blurredBanner = null;
+            _sharpBanner = null;
         }
+    }
+
+    private Bitmap CreateSharpBanner(Image source, int width, int height)
+    {
+        float imgRatio = (float)source.Width / source.Height;
+        float rectRatio = (float)width / height;
+        Rectangle srcRect;
+        if (imgRatio > rectRatio)
+        {
+            int cropWidth = (int)(source.Height * rectRatio);
+            srcRect = new Rectangle((source.Width - cropWidth) / 2, 0, cropWidth, source.Height);
+        }
+        else
+        {
+            int cropHeight = (int)(source.Width / rectRatio);
+            srcRect = new Rectangle(0, (source.Height - cropHeight) / 2, source.Width, cropHeight);
+        }
+
+        var result = new Bitmap(width, height);
+        using (var g = Graphics.FromImage(result))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.SmoothingMode = SmoothingMode.HighQuality;
+            g.DrawImage(source, new Rectangle(0, 0, width, height), srcRect, GraphicsUnit.Pixel);
+        }
+        return result;
+    }
+
+    private Bitmap CreateBlurredBanner(Image source, int width, int height, int blurFactor = 14)
+    {
+        int smallW = Math.Max(1, width / blurFactor);
+        int smallH = Math.Max(1, height / blurFactor);
+
+        float imgRatio = (float)source.Width / source.Height;
+        float rectRatio = (float)width / height;
+        Rectangle srcRect;
+        if (imgRatio > rectRatio)
+        {
+            int cropWidth = (int)(source.Height * rectRatio);
+            srcRect = new Rectangle((source.Width - cropWidth) / 2, 0, cropWidth, source.Height);
+        }
+        else
+        {
+            int cropHeight = (int)(source.Width / rectRatio);
+            srcRect = new Rectangle(0, (source.Height - cropHeight) / 2, source.Width, cropHeight);
+        }
+
+        using var small = new Bitmap(smallW, smallH);
+        using (var g = Graphics.FromImage(small))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.DrawImage(source, new Rectangle(0, 0, smallW, smallH), srcRect, GraphicsUnit.Pixel);
+        }
+
+        var result = new Bitmap(width, height);
+        using (var g = Graphics.FromImage(result))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.DrawImage(small, 0, 0, width, height);
+
+            using var dim = new SolidBrush(Color.FromArgb(40, 0, 0, 0));
+            g.FillRectangle(dim, 0, 0, width, height);
+        }
+        return result;
     }
 
     public void SetLoadingState(string statusText)
@@ -213,6 +391,10 @@ public class PlayerForm : Form
 
         _coverImage?.Dispose();
         _coverImage = null;
+        _blurredBanner?.Dispose();
+        _blurredBanner = null;
+        _sharpBanner?.Dispose();
+        _sharpBanner = null;
 
         if (!Visible) Show();
         BringToFront();
@@ -233,23 +415,27 @@ public class PlayerForm : Form
                 return;
             }
 
-            if (_playBtnBounds.Contains(e.Location))
+            // Les boutons audio réagissent uniquement si la miniature est survolée
+            if (_isHoveringBanner)
             {
-                _onPlayPauseToggled();
-                Invalidate();
-                return;
-            }
+                if (_playBtnBounds.Contains(e.Location))
+                {
+                    _onPlayPauseToggled();
+                    Invalidate();
+                    return;
+                }
 
-            if (_prevBtnBounds.Contains(e.Location))
-            {
-                SeekRelative(-5);
-                return;
-            }
+                if (_prevBtnBounds.Contains(e.Location))
+                {
+                    SeekRelative(-5);
+                    return;
+                }
 
-            if (_nextBtnBounds.Contains(e.Location))
-            {
-                SeekRelative(5);
-                return;
+                if (_nextBtnBounds.Contains(e.Location))
+                {
+                    SeekRelative(5);
+                    return;
+                }
             }
 
             if (_seekBarBounds.Contains(e.Location))
@@ -274,6 +460,9 @@ public class PlayerForm : Form
 
     private void PlayerForm_MouseMove(object? sender, MouseEventArgs e)
     {
+        bool wasHoveringBanner = _isHoveringBanner;
+        _isHoveringBanner = _bannerRect.Contains(e.Location);
+
         if (_isDragging)
         {
             Point dif = Point.Subtract(Cursor.Position, new Size(_dragCursorPoint));
@@ -286,6 +475,33 @@ public class PlayerForm : Form
         else if (_isUserVoluming)
         {
             HandleVolume(e.X);
+        }
+
+        var newHover = HoverTarget.None;
+        if (_closeBtnBounds.Contains(e.Location)) newHover = HoverTarget.Close;
+        else if (_isHoveringBanner)
+        {
+            if (_playBtnBounds.Contains(e.Location)) newHover = HoverTarget.Play;
+            else if (_prevBtnBounds.Contains(e.Location)) newHover = HoverTarget.Prev;
+            else if (_nextBtnBounds.Contains(e.Location)) newHover = HoverTarget.Next;
+        }
+
+        if (newHover != _hoveredButton || wasHoveringBanner != _isHoveringBanner)
+        {
+            _hoveredButton = newHover;
+            Cursor = newHover != HoverTarget.None ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
+    }
+
+    private void PlayerForm_MouseLeave(object? sender, EventArgs e)
+    {
+        if (_isHoveringBanner || _hoveredButton != HoverTarget.None)
+        {
+            _isHoveringBanner = false;
+            _hoveredButton = HoverTarget.None;
+            Cursor = Cursors.Default;
+            Invalidate();
         }
     }
 
@@ -346,68 +562,119 @@ public class PlayerForm : Form
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        // Fond principal
         g.Clear(_bgColor);
 
-        // Miniature
-        Rectangle coverRect = new Rectangle(20, 30, Width - 40, 130);
-        using (GraphicsPath coverPath = GetRoundedRectPath(coverRect, 18))
+        DrawBanner(g);
+        DrawBannerControls(g);
+        DrawProgressRow(g);
+        DrawTitleBlock(g);
+        DrawVolumeRow(g);
+    }
+
+    private void DrawBanner(Graphics g)
+    {
+        using GraphicsPath bannerPath = GetTopRoundedRectPath(_bannerRect, 24);
+        GraphicsState state = g.Save();
+        g.SetClip(bannerPath);
+
+        // Si survolé : affiche le bandeau flou. Sinon : affiche le bandeau net.
+        if (_isHoveringBanner && _blurredBanner != null)
         {
-            if (_coverImage != null)
+            g.DrawImage(_blurredBanner, _bannerRect);
+        }
+        else if (!_isHoveringBanner && _sharpBanner != null)
+        {
+            g.DrawImage(_sharpBanner, _bannerRect);
+        }
+        else
+        {
+            using var placeholder = new LinearGradientBrush(
+                _bannerRect, _coverBgColor, _coverBgColor2, LinearGradientMode.ForwardDiagonal);
+            g.FillRectangle(placeholder, _bannerRect);
+            DrawMusicNote(g, new Point(_bannerRect.Width / 2, _bannerRect.Height / 2 - 20));
+        }
+
+        // Voile d'ombrage lors du survol pour améliorer le contraste des boutons
+        if (_isHoveringBanner)
+        {
+            using var overlay = new LinearGradientBrush(
+                _bannerRect,
+                Color.FromArgb(10, 0, 0, 0),
+                Color.FromArgb(150, 0, 0, 0),
+                LinearGradientMode.Vertical);
+            var blend = new ColorBlend
             {
-                GraphicsState state = g.Save();
-                g.SetClip(coverPath);
-
-                // Rendu intelligent (Center-Crop sans déformation de la miniature 16:9)
-                float imgRatio = (float)_coverImage.Width / _coverImage.Height;
-                float rectRatio = (float)coverRect.Width / coverRect.Height;
-                
-                Rectangle drawRect = coverRect;
-                if (imgRatio > rectRatio)
+                Colors = new[]
                 {
-                    int newWidth = (int)(coverRect.Height * imgRatio);
-                    drawRect = new Rectangle(coverRect.X - (newWidth - coverRect.Width) / 2, coverRect.Y, newWidth, coverRect.Height);
-                }
-                else
-                {
-                    int newHeight = (int)(coverRect.Width / imgRatio);
-                    drawRect = new Rectangle(coverRect.X, coverRect.Y - (newHeight - coverRect.Height) / 2, coverRect.Width, newHeight);
-                }
+                    Color.FromArgb(0, 0, 0, 0),
+                    Color.FromArgb(20, 0, 0, 0),
+                    Color.FromArgb(170, 0, 0, 0)
+                },
+                Positions = new[] { 0f, 0.45f, 1f }
+            };
+            overlay.InterpolationColors = blend;
+            g.FillRectangle(overlay, _bannerRect);
+        }
 
-                g.DrawImage(_coverImage, drawRect);
-                g.Restore(state);
+        g.Restore(state);
+    }
+
+    private void DrawBannerControls(Graphics g)
+    {
+        // Croix de fermeture (toujours affichée)
+        bool closeHover = _hoveredButton == HoverTarget.Close;
+        using (SolidBrush closeBg = new SolidBrush(Color.FromArgb(closeHover ? 90 : 55, 0, 0, 0)))
+        {
+            g.FillEllipse(closeBg, _closeBtnBounds);
+        }
+        using (Pen closePen = new Pen(Color.White, 1.6f))
+        {
+            int pad = 8;
+            g.DrawLine(closePen, _closeBtnBounds.X + pad, _closeBtnBounds.Y + pad, _closeBtnBounds.Right - pad, _closeBtnBounds.Bottom - pad);
+            g.DrawLine(closePen, _closeBtnBounds.Right - pad, _closeBtnBounds.Y + pad, _closeBtnBounds.X + pad, _closeBtnBounds.Bottom - pad);
+        }
+
+        // Afficher les boutons Play / Avancer / Reculer SEULEMENT en cas de survol de la miniature
+        if (_isHoveringBanner)
+        {
+            // Précédent (-5s)
+            DrawGlassCircle(g, _prevBtnBounds, _hoveredButton == HoverTarget.Prev);
+            DrawCircularArrow(g, _prevBtnBounds, Color.White, isForward: false);
+
+            // Suivant (+5s)
+            DrawGlassCircle(g, _nextBtnBounds, _hoveredButton == HoverTarget.Next);
+            DrawCircularArrow(g, _nextBtnBounds, Color.White, isForward: true);
+
+            // Lecture / Pause
+            bool playHover = _hoveredButton == HoverTarget.Play;
+            int growth = playHover ? 2 : 0;
+            Rectangle playCircle = Rectangle.Inflate(_playBtnBounds, growth, growth);
+            using (SolidBrush playBg = new SolidBrush(Color.White))
+            {
+                g.FillEllipse(playBg, playCircle);
             }
+
+            bool isPlaying = _outputDevice != null && _outputDevice.PlaybackState == PlaybackState.Playing;
+            Color iconColor = Color.FromArgb(20, 20, 24);
+            if (isPlaying)
+                DrawPauseIcon(g, playCircle, iconColor);
             else
-            {
-                using SolidBrush coverBrush = new SolidBrush(_coverBgColor);
-                g.FillPath(coverBrush, coverPath);
-                DrawMusicNote(g, new Point(coverRect.X + coverRect.Width / 2, coverRect.Y + coverRect.Height / 2));
-            }
+                DrawPlayIcon(g, playCircle, iconColor);
         }
+    }
 
-        // Croix de fermeture
-        using (Pen closePen = new Pen(_primaryTextColor, 1.5f))
-        {
-            g.DrawLine(closePen, _closeBtnBounds.X, _closeBtnBounds.Y, _closeBtnBounds.Right, _closeBtnBounds.Bottom);
-            g.DrawLine(closePen, _closeBtnBounds.Right, _closeBtnBounds.Y, _closeBtnBounds.X, _closeBtnBounds.Bottom);
-        }
+    private void DrawGlassCircle(Graphics g, Rectangle r, bool hovered)
+    {
+        using SolidBrush b = new SolidBrush(Color.FromArgb(hovered ? 55 : 28, 255, 255, 255));
+        g.FillEllipse(b, r);
+    }
 
-        // 4. Titre et Nom de la Chaîne YouTube
-        using (Font titleFont = new Font("Segoe UI", 10.5f, FontStyle.Bold))
-        using (Font artistFont = new Font("Segoe UI", 9f, FontStyle.Regular))
-        using (SolidBrush titleBrush = new SolidBrush(_primaryTextColor))
-        using (SolidBrush artistBrush = new SolidBrush(_secondaryTextColor))
-        {
-            StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
-            g.DrawString(_songTitle, titleFont, titleBrush, new RectangleF(15, 172, Width - 30, 22), sf);
-            g.DrawString(_artistName, artistFont, artistBrush, new RectangleF(15, 194, Width - 30, 18), sf);
-        }
-
-        // Barre de Progression + Temps
+    private void DrawProgressRow(Graphics g)
+    {
         using (Pen bgTrackPen = new Pen(_trackBgColor, 3))
-        using (Pen fillTrackPen = new Pen(_iconColor, 3))
+        using (Pen fillTrackPen = new Pen(_accentColor, 3))
         {
-            int yTrack = _seekBarBounds.Y + 3;
+            int yTrack = _seekBarBounds.Y + 5;
             g.DrawLine(bgTrackPen, _seekBarBounds.X, yTrack, _seekBarBounds.Right, yTrack);
 
             int progressWidth = (int)(_seekBarBounds.Width * Math.Clamp(_currentProgress, 0.0, 1.0));
@@ -416,39 +683,41 @@ public class PlayerForm : Form
                 g.DrawLine(fillTrackPen, _seekBarBounds.X, yTrack, _seekBarBounds.X + progressWidth, yTrack);
             }
 
-            using SolidBrush thumbBrush = new SolidBrush(_iconColor);
+            using SolidBrush thumbBrush = new SolidBrush(_accentColor);
             g.FillEllipse(thumbBrush, _seekBarBounds.X + progressWidth - 5, yTrack - 5, 10, 10);
         }
 
         TimeSpan currentTS = _audioFile != null ? _audioFile.CurrentTime : TimeSpan.Zero;
         TimeSpan totalTS = _audioFile != null ? _audioFile.TotalTime : TimeSpan.Zero;
 
-        using (Font timeFont = new Font("Segoe UI", 8.5f, FontStyle.Regular))
-        using (SolidBrush timeBrush = new SolidBrush(_secondaryTextColor))
-        {
-            g.DrawString($"{currentTS:mm\\:ss}", timeFont, timeBrush, _seekBarBounds.X, _seekBarBounds.Y + 12);
-            StringFormat sfRight = new StringFormat { Alignment = StringAlignment.Far };
-            g.DrawString($"{totalTS:mm\\:ss}", timeFont, timeBrush, _seekBarBounds.Right, _seekBarBounds.Y + 12, sfRight);
-        }
+        using Font timeFont = new Font("Segoe UI", 8f, FontStyle.Regular);
+        using SolidBrush timeBrush = new SolidBrush(_secondaryTextColor);
+        int yTime = _seekBarBounds.Bottom - 2;
+        g.DrawString($"{currentTS:mm\\:ss}", timeFont, timeBrush, _seekBarBounds.X, yTime);
+        StringFormat sfRight = new StringFormat { Alignment = StringAlignment.Far };
+        g.DrawString($"{totalTS:mm\\:ss}", timeFont, timeBrush, _seekBarBounds.Right, yTime, sfRight);
+    }
 
-        // Boutons (-5s, Play/Pause, +5s)
-        DrawCircularArrow(g, _prevBtnBounds, _iconColor, isForward: false);
+    private void DrawTitleBlock(Graphics g)
+    {
+        using Font titleFont = new Font("Segoe UI Semibold", 11f, FontStyle.Bold);
+        using Font artistFont = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+        using SolidBrush titleBrush = new SolidBrush(_primaryTextColor);
+        using SolidBrush artistBrush = new SolidBrush(_secondaryTextColor);
 
-        bool isPlaying = _outputDevice != null && _outputDevice.PlaybackState == PlaybackState.Playing;
-        if (isPlaying)
-            DrawPauseIcon(g, _playBtnBounds, _iconColor);
-        else
-            DrawPlayIcon(g, _playBtnBounds, _iconColor);
+        StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
+        g.DrawString(_songTitle, titleFont, titleBrush, new RectangleF(15, 236, Width - 30, 24), sf);
+        g.DrawString(_artistName, artistFont, artistBrush, new RectangleF(15, 260, Width - 30, 18), sf);
+    }
 
-        DrawCircularArrow(g, _nextBtnBounds, _iconColor, isForward: true);
-
-        // Barre de Volume + Icônes
+    private void DrawVolumeRow(Graphics g)
+    {
         DrawSpeakerIcon(g, new Point(_volumeBarBounds.X - 22, _volumeBarBounds.Y - 2), _secondaryTextColor, isHigh: false);
 
         using (Pen bgVolPen = new Pen(_trackBgColor, 3))
-        using (Pen fillVolPen = new Pen(_iconColor, 3))
+        using (Pen fillVolPen = new Pen(_accentColor, 3))
         {
-            int yVol = _volumeBarBounds.Y + 3;
+            int yVol = _volumeBarBounds.Y + 5;
             g.DrawLine(bgVolPen, _volumeBarBounds.X, yVol, _volumeBarBounds.Right, yVol);
 
             int volWidth = (int)(_volumeBarBounds.Width * Math.Clamp(_currentVolume, 0.0f, 1.0f));
@@ -457,8 +726,8 @@ public class PlayerForm : Form
                 g.DrawLine(fillVolPen, _volumeBarBounds.X, yVol, _volumeBarBounds.X + volWidth, yVol);
             }
 
-            using SolidBrush volThumb = new SolidBrush(_iconColor);
-            g.FillEllipse(volThumb, _volumeBarBounds.X + volWidth - 9, yVol - 9, 18, 18);
+            using SolidBrush volThumb = new SolidBrush(_accentColor);
+            g.FillEllipse(volThumb, _volumeBarBounds.X + volWidth - 7, yVol - 7, 14, 14);
         }
 
         DrawSpeakerIcon(g, new Point(_volumeBarBounds.Right + 8, _volumeBarBounds.Y - 2), _secondaryTextColor, isHigh: true);
@@ -467,8 +736,8 @@ public class PlayerForm : Form
     // --- ICÔNES ---
     private void DrawMusicNote(Graphics g, Point center)
     {
-        using SolidBrush b = new SolidBrush(Color.White);
-        using Pen p = new Pen(Color.White, 3);
+        using SolidBrush b = new SolidBrush(Color.FromArgb(230, 255, 255, 255));
+        using Pen p = new Pen(Color.FromArgb(230, 255, 255, 255), 3);
         g.FillEllipse(b, center.X - 18, center.Y + 6, 12, 8);
         g.DrawLine(p, center.X - 8, center.Y + 10, center.X - 8, center.Y - 14);
         g.DrawLine(p, center.X - 8, center.Y - 14, center.X + 8, center.Y - 20);
@@ -478,9 +747,9 @@ public class PlayerForm : Form
     {
         using SolidBrush b = new SolidBrush(color);
         PointF[] p = {
-            new PointF(r.X + 16, r.Y + 10),
-            new PointF(r.X + 16, r.Y + r.Height - 10),
-            new PointF(r.X + r.Width - 10, r.Y + r.Height / 2)
+            new PointF(r.X + r.Width * 0.40f, r.Y + r.Height * 0.28f),
+            new PointF(r.X + r.Width * 0.40f, r.Y + r.Height * 0.72f),
+            new PointF(r.X + r.Width * 0.74f, r.Y + r.Height * 0.5f)
         };
         g.FillPolygon(b, p);
     }
@@ -488,19 +757,21 @@ public class PlayerForm : Form
     private void DrawPauseIcon(Graphics g, Rectangle r, Color color)
     {
         using SolidBrush b = new SolidBrush(color);
-        g.FillRectangle(b, r.X + 13, r.Y + 10, 8, r.Height - 20);
-        g.FillRectangle(b, r.X + 28, r.Y + 10, 8, r.Height - 20);
+        float barW = r.Width * 0.11f;
+        float barH = r.Height * 0.4f;
+        g.FillRectangle(b, r.X + r.Width * 0.34f, r.Y + (r.Height - barH) / 2, barW, barH);
+        g.FillRectangle(b, r.X + r.Width * 0.55f, r.Y + (r.Height - barH) / 2, barW, barH);
     }
 
     private void DrawCircularArrow(Graphics g, Rectangle r, Color color, bool isForward)
     {
-        int margin = 7;
+        int margin = 9;
         Rectangle arcRect = new Rectangle(r.X + margin, r.Y + margin, r.Width - margin * 2, r.Height - margin * 2);
 
         if (arcRect.Width <= 0 || arcRect.Height <= 0) return;
 
         using Pen p = new Pen(color, 2.0f);
-        using CustomLineCap arrowCap = new AdjustableArrowCap(3.5f, 4.0f, true);
+        using CustomLineCap arrowCap = new AdjustableArrowCap(3.2f, 3.6f, true);
         p.CustomEndCap = arrowCap;
 
         if (isForward)
@@ -551,18 +822,16 @@ public class PlayerForm : Form
         return path;
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e)
+    private GraphicsPath GetTopRoundedRectPath(Rectangle rect, int radius)
     {
-        SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
+        GraphicsPath path = new GraphicsPath();
+        int diameter = radius * 2;
 
-        _coverImage?.Dispose();
-        _coverImage = null;
-
-        if (e.CloseReason == CloseReason.UserClosing)
-        {
-            e.Cancel = true;
-            Hide();
-        }
-        base.OnFormClosing(e);
+        path.AddArc(rect.X, rect.Y, diameter, diameter, 180, 90);
+        path.AddArc(rect.Right - diameter, rect.Y, diameter, diameter, 270, 90);
+        path.AddLine(rect.Right, rect.Y + radius, rect.Right, rect.Bottom);
+        path.AddLine(rect.Right, rect.Bottom, rect.X, rect.Bottom);
+        path.CloseFigure();
+        return path;
     }
 }

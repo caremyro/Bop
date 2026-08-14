@@ -105,12 +105,6 @@ public class BopApplicationContext : ApplicationContext
             onPlayPauseToggled: () => TogglePlayPause(),
             onStopRequested: () => StopAudio()
         );
-
-        try
-        {
-            HotkeyManager.Current.AddOrReplace("PlayPause", Keys.P | Keys.Control | Keys.Shift, OnGlobalHotkey);
-        }
-        catch { }
     }
 
     // --- GESTION DES ÉVÉNEMENTS DU MENU CONTEXTUEL ---
@@ -249,6 +243,7 @@ public class BopApplicationContext : ApplicationContext
         e.Handled = true;
     }
 
+    
     // --- MÉTHODES DE CONTRÔLE DE LA LECTURE AUDIO ---
     private void TogglePlayPause()
     {
