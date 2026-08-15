@@ -324,7 +324,7 @@ public class BopApplicationContext : ApplicationContext
             }
             catch (Exception ex)
             {
-                _playerForm.SetLoadingState($"Error: {ex.Message}");
+                _playerForm.SetLoadingState($"Unable to read your URL, please try again.");
             }
         }
         finally
@@ -340,7 +340,7 @@ public class BopApplicationContext : ApplicationContext
             // Le flux s'est arrêté à cause d'une erreur (ex. coupure réseau) et non
             // parce que la piste est terminée : ne pas enchaîner sur la suivante
             // silencieusement, informer l'utilisateur à la place.
-            _playerForm?.SetLoadingState($"Playback error: {e.Exception.Message}");
+            _playerForm?.SetLoadingState($"Playback stopped due to a network or stream error.");
             return;
         }
 
